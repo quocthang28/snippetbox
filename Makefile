@@ -1,2 +1,2 @@
 air:
-	cd cmd && cd web && air
+	cd cmd/web && air

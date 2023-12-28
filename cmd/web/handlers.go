@@ -1,71 +1,115 @@
 package main
 
 import (
+	"errors"
 	"fmt"
-	"html/template"
 	"net/http"
 	"strconv"
 
-	"snippetbox/internal/utils"
+	"snippetbox/internal/models"
+	"snippetbox/internal/validator"
+
+	"github.com/julienschmidt/httprouter"
 )
 
 func (app *application) home(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		app.notFound(w) // Use the notFound() helper
+	// Because httprouter matches the "/" path exactly, we can now remove the
+	// manual check of r.URL.Path != "/" from this handler.
+	snippets, err := app.snippets.Latest()
+	if err != nil {
+		app.serverError(w, r, err)
 		return
 	}
-
-	// Initialize a slice containing the paths to the two files. It's important
-	// to note that the file containing our base template must be the *first*
-	// file in the slice.
-	files := []string{
-		utils.UnixToWindowsPath("./ui/html/base.tmpl"),
-		utils.UnixToWindowsPath("./ui/html/partials/nav.tmpl"),
-		utils.UnixToWindowsPath("./ui/html/pages/home.tmpl"),
-	}
-
-	// Use the template.ParseFiles() function to read the template file into a
-	// template set. If there's an error, we log the detailed error message and use
-	// the http.Error() function to send a generic 500 Internal Server Error
-	// response to the user. Note that we use the net/http constant
-	// http.StatusInternalServerError here instead of the integer 500 directly.
-	ts, err := template.ParseFiles(files...)
-	if err != nil {
-		// Because the home handler is now a method against the application
-		// struct it can access its fields, including the structured logger. We'll
-		// use this to create a log entry at Error level containing the error
-		// message, also including the request method and URI as attributes to
-		// assist with debugging.
-		app.serverError(w, r, err) // Use the serverError() helper.
-		return
-	}
-
-	// Use the ExecuteTemplate() method to write the content of the "base"
-	// template as the response body.
-	err = ts.ExecuteTemplate(w, "base", nil)
-	if err != nil {
-		// And we also need to update the code here to use the structured logger
-		// too.
-		app.serverError(w, r, err) // Use the serverError() helper.
-	}
+	data := app.newTemplateData(r)
+	data.Snippets = snippets
+	app.render(w, r, http.StatusOK, "home.tmpl", data)
 }
 
 func (app *application) snippetView(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.Atoi(r.URL.Query().Get("id"))
+	// When httprouter is parsing a request, the values of any named parameters
+	// will be stored in the request context. We'll talk about request context
+	// in detail later in the book, but for now it's enough to know that you can
+	// use the ParamsFromContext() function to retrieve a slice containing these
+	// parameter names and values like so:
+	params := httprouter.ParamsFromContext(r.Context())
+	// We can then use the ByName() method to get the value of the "id" named
+	// parameter from the slice and validate it as normal.
+	id, err := strconv.Atoi(params.ByName("id"))
 	if err != nil || id < 1 {
-		app.notFound(w) // Use the notFound() helper.
+		app.notFound(w)
 		return
 	}
+	snippet, err := app.snippets.Get(id)
+	if err != nil {
+		if errors.Is(err, models.ErrNoRecord) {
+			app.notFound(w)
+		} else {
+			app.serverError(w, r, err)
+		}
+		return
+	}
+	// Use the PopString() method to retrieve the value for the "flash" key.
+	// PopString() also deletes the key and value from the session data, so it
+	// acts like a one-time fetch. If there is no matching key in the session
+	// data this will return the empty string.
+	data := app.newTemplateData(r)
+	data.Snippet = snippet
 
-	fmt.Fprintf(w, "Display a specific snippet with ID %d...", id)
+	app.render(w, r, http.StatusOK, "view.tmpl", data)
 }
 
+// Add a new snippetCreate handler, which for now returns a placeholder
+// response. We'll update this shortly to show a HTML form.
 func (app *application) snippetCreate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+	data := app.newTemplateData(r)
+	// Initialize a new createSnippetForm instance and pass it to the template.
+	// Notice how this is also a great opportunity to set any default or
+	// 'initial' values for the form --- here we set the initial value for the
+	// snippet expiry to 365 days.
+	data.Form = snippetCreateForm{
+		Expires: 365,
+	}
+
+	app.render(w, r, http.StatusOK, "create.tmpl", data)
+}
+
+// Define a snippetCreateForm struct to represent the form data and validation
+// errors for the form fields. Note that all the struct fields are deliberately
+// exported (i.e. start with a capital letter). This is because struct fields
+// must be exported in order to be read by the html/template package when
+// rendering the template.
+type snippetCreateForm struct {
+	Title               string `form:"title"`
+	Content             string `form:"content"`
+	Expires             int    `form:"expires"`
+	validator.Validator `form:"-"`
+}
+
+func (app *application) snippetCreatePost(w http.ResponseWriter, r *http.Request) {
+	var form snippetCreateForm
+	err := app.decodePostForm(r, &form)
+	if err != nil {
+		app.clientError(w, http.StatusBadRequest)
 		return
 	}
 
-	w.Write([]byte("Create a new snippet..."))
+	form.CheckField(validator.NotBlank(form.Title), "title", "This field cannot be blank")
+	form.CheckField(validator.MaxChars(form.Title, 100), "title", "This field cannot be more than 100 characters long")
+	form.CheckField(validator.NotBlank(form.Content), "content", "This field cannot be blank")
+	form.CheckField(validator.PermittedValue(form.Expires, 1, 7, 365), "expires", "This field must equal 1, 7 or 365")
+	if !form.Valid() {
+		data := app.newTemplateData(r)
+		data.Form = form
+		app.render(w, r, http.StatusUnprocessableEntity, "create.tmpl", data)
+		return
+	}
+	id, err := app.snippets.Insert(form.Title, form.Content, form.Expires)
+	if err != nil {
+		app.serverError(w, r, err)
+		return
+	}
+
+	app.sessionManager.Put(r.Context(), "flash", "Snippet successfully created!")
+
+	http.Redirect(w, r, fmt.Sprintf("/snippet/view/%d", id), http.StatusSeeOther)
 }
